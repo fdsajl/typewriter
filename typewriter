@@ -1,0 +1,280 @@
+(() => {
+  // ---------- GUI ----------
+  const id = 'hts-advanced-' + Math.floor(Math.random()*1e6);
+  if (document.getElementById(id)) document.getElementById(id).remove();
+
+  const gui = document.createElement('div');
+  gui.id = id;
+  gui.style.cssText = `
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    width: 420px;
+    background: #fff;
+    color: #111;
+    border-radius: 10px;
+    padding: 12px 16px 16px 16px;
+    z-index: 2147483647;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.2);
+  `;
+  gui.innerHTML = `
+    <strong style="display:block;margin-bottom:6px">Human Typing + Realistic Edits</strong>
+    <textarea id="hts-src" placeholder="Paste text here..." style="width:100%;height:120px;padding:8px;font-size:13px;"></textarea>
+    <div style="margin-top:8px;font-size:13px;color:#222; user-select:none;">
+      <label for="hts-wpm" style="display:block; margin-bottom:4px; font-weight:600;">
+        Typing Speed (WPM): <span id="hts-wpm-val">30</span>
+      </label>
+      <input id="hts-wpm" type="range" min="10" max="120" value="30" step="1" style="width:100%; cursor:pointer;">
+    </div>
+    <div style="display:flex;gap:6px;margin-top:12px">
+      <input id="hts-start-btn" type="button" value="Start Typing" style="flex:1;padding:8px;cursor:pointer; font-weight:600;"/>
+      <input id="hts-stop-btn" type="button" value="Stop" style="width:72px;padding:8px;cursor:pointer; font-weight:600;"/>
+    </div>
+    <div style="margin-top:8px;font-size:12px;color:#555;line-height:1.3; user-select:none;">
+      Focus your target input/textarea/contenteditable BEFORE starting.<br>
+      <label><input id="hts-editing" type="checkbox" checked/> Enable mid-run edits</label><br>
+      <small>Pauses every 2 to 4 sentences (30s to 5min). Whole-word deletions only.<br>
+      During edits, types rephrased version first, deletes it, then types original phrase.</small>
+    </div>
+  `;
+  document.body.appendChild(gui);
+
+  // Update WPM label on slider change and initialize label
+  const wpmSlider = document.getElementById('hts-wpm');
+  const wpmLabel = document.getElementById('hts-wpm-val');
+  wpmLabel.textContent = wpmSlider.value;
+  wpmSlider.oninput = () => {
+    wpmLabel.textContent = wpmSlider.value;
+  };
+
+  // ---------- Helpers / Config ----------
+  const cfg = {
+    midWordPauseProb: 0.04,
+    smallCorrectionProb: 0.03,
+    interruptionProb: 0.04,
+    editExistingProb: 0.08,
+    maxBackWords: 6,
+    pauseMinMs: 30_000,
+    pauseMaxMs: 300_000
+  };
+
+  const rand = (a,b) => Math.random()*(b-a)+a;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const pick = arr => arr[Math.floor(Math.random()*arr.length)];
+
+  // --- VERY LIGHT rephrase (small built-in synonym dictionary + light swaps)
+  function lightRephrase(text) {
+    const synonyms = {
+      quick: ['fast', 'swift', 'rapid'],
+      small: ['tiny', 'little', 'minor'],
+      good: ['nice', 'great', 'fine'],
+      happy: ['glad', 'pleased', 'joyful'],
+      sad: ['unhappy', 'down', 'mournful'],
+      say: ['state', 'mention', 'tell'],
+      ask: ['request', 'inquire'],
+      big: ['large', 'huge', 'vast'],
+      help: ['assist', 'aid', 'support'],
+      important: ['crucial', 'vital', 'key']
+    };
+
+    // split preserving boundary tokens (spaces/punctuation)
+    let parts = text.split(/(\b|\s+)/);
+
+    // replace a few words with close synonyms
+    let replaced = 0;
+    const targetReplaceCount = Math.max(1, Math.floor(parts.length * 0.08)); // small fraction
+    for (let i=0; i<parts.length && replaced < targetReplaceCount; i++) {
+      const w = parts[i].toLowerCase();
+      if (synonyms[w] && Math.random() < 0.35) {
+        const chosen = pick(synonyms[w]);
+        // keep capitalization
+        parts[i] = parts[i][0] === parts[i][0].toUpperCase()
+          ? chosen.charAt(0).toUpperCase() + chosen.slice(1)
+          : chosen;
+        replaced++;
+      }
+    }
+
+    // light adjacent swaps occasionally
+    for (let i=0; i<parts.length-2; i++) {
+      if (!parts[i].trim() || !parts[i+1].trim()) continue;
+      if (Math.random() < 0.08) {
+        const t = parts[i];
+        parts[i] = parts[i+1];
+        parts[i+1] = t;
+        i++;
+      }
+    }
+
+    return parts.join('');
+  }
+
+  // Set/get element value with input event
+  function setElValue(el, val) {
+    if (!el) return;
+    if (el.isContentEditable) el.innerText = val;
+    else el.value = val;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  function getElValue(el) {
+    if (!el) return '';
+    return el.isContentEditable ? el.innerText : el.value;
+  }
+
+  // ---------- Typing primitives ----------
+  async function typeChars(el, str, baseDelay) {
+    for (let i=0; i<str.length && running; i++) {
+      const ch = str[i];
+      setElValue(el, getElValue(el) + ch);
+      if (ch.match(/\S/)) {
+        if (Math.random() < cfg.midWordPauseProb) await sleep(rand(baseDelay*1.5, baseDelay*3));
+        else await sleep(baseDelay + Math.random()*baseDelay*0.5);
+      } else {
+        await sleep(baseDelay + Math.random()*baseDelay);
+      }
+    }
+  }
+
+  // backspace n characters
+  async function deleteChars(el, n, delay) {
+    for (let i=0; i<n && running; i++) {
+      setElValue(el, getElValue(el).slice(0, -1));
+      await sleep(rand(delay*0.35, delay*0.8));
+    }
+  }
+
+  // ---------- Edit flow ----------
+  // Pick chunk of words from current typed text (original phrase)
+  // Then do:
+  // 1) Type lightly rephrased version instead of original (do NOT type original first)
+  // 2) Pause
+  // 3) Delete rephrased version
+  // 4) Type original phrase
+  async function editEarlier(el, baseDelay, allowEdits) {
+    if (!allowEdits) return;
+    const curText = getElValue(el);
+    if (!curText || curText.length < 6) return;
+
+    const wordsArr = curText.split(/\s+/).filter(Boolean);
+    if (wordsArr.length < 2) return;
+
+    const take = Math.min(cfg.maxBackWords, Math.max(1, Math.floor(Math.random()*cfg.maxBackWords)));
+
+    // Extract last 'take' words as original phrase
+    const originalPhrase = wordsArr.slice(wordsArr.length - take).join(' ');
+
+    // Retry up to 5 times to get a different rephrased phrase
+    let rephrasedPhrase = '';
+    let tries = 0;
+    do {
+      rephrasedPhrase = lightRephrase(originalPhrase);
+      tries++;
+    } while (rephrasedPhrase.trim() === originalPhrase.trim() && tries < 5);
+
+    // If rephrase is still identical, skip editing
+    if (rephrasedPhrase.trim() === originalPhrase.trim()) return;
+
+    // Delete original phrase from end
+    const lastIndex = curText.lastIndexOf(originalPhrase);
+    if (lastIndex === -1) return; // safety fallback
+
+    const charsToRemove = curText.length - lastIndex;
+    if (charsToRemove <= 0) return;
+
+    // Backspace original phrase
+    await deleteChars(el, charsToRemove, baseDelay);
+
+    // Type rephrased phrase (with leading space if needed)
+    await typeChars(el, (getElValue(el).endsWith(' ') ? '' : ' ') + rephrasedPhrase, baseDelay);
+
+    // Pause to simulate reconsideration/thinking
+    await sleep(rand(baseDelay*6, baseDelay*12));
+
+    // Delete rephrased phrase
+    await deleteChars(el, rephrasedPhrase.length + ((getElValue(el).endsWith(' ') ? 0 : 1)), baseDelay);
+
+    // Pause briefly before final typing
+    await sleep(rand(baseDelay*2, baseDelay*5));
+
+    // Type original phrase exactly (leading space if needed)
+    await typeChars(el, (getElValue(el).endsWith(' ') ? '' : ' ') + originalPhrase, baseDelay);
+  }
+
+  // ---------- Run control ----------
+  let running = false;
+  document.getElementById('hts-stop-btn').onclick = () => { running = false; };
+
+  let lastFocusedEl = null;
+  document.addEventListener('focusin', e => {
+    if (e.target.closest('#' + id)) return;
+    lastFocusedEl = e.target;
+  });
+
+  document.getElementById('hts-start-btn').onclick = async () => {
+    if (running) return;
+    running = true;
+
+    const source = document.getElementById('hts-src').value || '';
+    if (!source.trim()) { alert('Paste text into the GUI first.'); running=false; return; }
+
+    const allowEdits = document.getElementById('hts-editing').checked;
+    const target = lastFocusedEl;
+    if (!target || !(target.tagName && (target.tagName.match(/INPUT|TEXTAREA/) || target.isContentEditable))) {
+      alert('Focus your target input/textarea/contenteditable BEFORE clicking Start.');
+      running=false; 
+      return;
+    }
+
+    // Calculate delay per char from WPM slider
+    const wpm = +wpmSlider.value;
+    const baseDelay = 60000 / (wpm * 6);
+
+    const tokens = source.split(/(\s+)/);
+
+    let sentenceCount = 0;
+    let sentencesBetweenPause = Math.floor(Math.random() * 3) + 2; // 2-4 random
+
+    for (let tIndex=0; tIndex<tokens.length && running; tIndex++) {
+      const token = tokens[tIndex];
+      if (token.trim() === '') {
+        await typeChars(target, token, baseDelay);
+        continue;
+      }
+
+      await typeChars(target, token, baseDelay);
+
+      // sentence tracking and long pauses
+      if (/[.!?]$/.test(token)) {
+        sentenceCount++;
+        if (sentenceCount >= sentencesBetweenPause) {
+          sentenceCount = 0;
+          sentencesBetweenPause = Math.floor(Math.random() * 3) + 2;
+          if (running) {
+            const longPause = rand(cfg.pauseMinMs, cfg.pauseMaxMs);
+            console.log(`-- Long pause ${(longPause/1000).toFixed(1)} seconds --`);
+            await sleep(longPause);
+          }
+        } else if (running) {
+          await sleep(rand(500, 1500));
+        }
+      } else if (running) {
+        if (Math.random() < 0.02) await sleep(rand(700, 2200));
+      }
+
+      // occasionally edit earlier
+      if (Math.random() < cfg.interruptionProb && running && allowEdits && !/[.!?]$/.test(token)) {
+        await sleep(rand(100,400));
+        await editEarlier(target, baseDelay, allowEdits);
+      }
+      if (Math.random() < cfg.editExistingProb && running && allowEdits) {
+        await sleep(rand(100,300));
+        await editEarlier(target, baseDelay, allowEdits);
+      }
+    }
+
+    running = false;
+  };
+
+  gui.addEventListener('dblclick', () => { gui.remove(); });
+})();
